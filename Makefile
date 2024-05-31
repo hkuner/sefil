@@ -1,3 +1,5 @@
+all: sefil.efi ;
+
 include Makefile.conf
 
 VPATH += posix-uefi
@@ -9,10 +11,9 @@ run: disk.img
 # mtools disk offset:
 #   https://www.gnu.org/software/mtools/manual/html_node/drive-letters.html#drive-letters
 disk.img: sefil.efi disk_layout.sfd
-	$(RM) $@
 	@$(PRINT) Making disk image.
 	$(TRUNCATE) --size 64M $@
-	$(SFDISK) $@ <disk_layout.sfd
+	$(SFDISK) $@ <disk_layout.sfd >/dev/null
 	@$(PRINT) format fat32
 	$(MFORMAT) -Fi $@@@1024K ::
 	@$(PRINT) mkdir and boot.efi

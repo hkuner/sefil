@@ -63,7 +63,7 @@ void * efi_get_variable(char *name, efi_guid_t guid, uintn_t *size) {
 
 enum { BOOT_ENTRY_MAX = 15 };
 struct {
-    uint32_t size;
+    int size;
     uint32_t option_size[BOOT_ENTRY_MAX];
     efi_load_option_header_t *option[BOOT_ENTRY_MAX];
 } boot_entries;
@@ -85,21 +85,48 @@ struct {
                              ];                                                 \
     } *)boot_entries.option[index])
 
+int menuselect = 0;
 void menu() {
-    char c = 0;
-    for(; c!='q';) {
+    efi_status_t status;
+    uintn_t idx;
+    efi_input_key_t key = {0};
+
+    for(;;) {
+        ST->ConOut->SetAttribute(ST->ConOut, 0x0F);
         ST->ConOut->ClearScreen(ST->ConOut);
-        printf("                          BootMenu\n");
-        printf("+----------------------------------------------------------+\n");
-        for(size_t i = 0; i<boot_entries.size; ++i) {
-            char u8strbuf[LINE_MAX];
-            wcstombs(u8strbuf, GET_BOOT_ENTRY(i)->description, LINE_MAX);
-            int wb = 59-printf("+ %lu. %s", i, u8strbuf);
-            while(wb--) putchar(' ');
-            printf("+\n");
+
+        printf("                                    BootMenu                                    \n");
+        printf("+------------------------------------------------------------------------------+\n");
+        for(int i = 0; i<BOOT_ENTRY_MAX; ++i) {
+            if(i<boot_entries.size) {
+                putchar('+');
+                if(i==menuselect)
+                    ST->ConOut->SetAttribute(ST->ConOut, 0x70);
+                int num = printf(" %d. ", i);
+                ST->ConOut->OutputString(ST->ConOut, GET_BOOT_ENTRY(i)->description);
+                int wb = 78-num-wstrlen(GET_BOOT_ENTRY(i)->description);
+                while(wb--) putchar(' ');
+                if(i==menuselect)
+                    ST->ConOut->SetAttribute(ST->ConOut, 0x0F);
+                printf("+\n");
+            }
+            else {
+                printf("+                                                                              +\n");
+            }
         }
-        printf("+----------------------------------------------------------+\n");
-        c = getchar();
+        printf("+------------------------------------------------------------------------------+\n");
+
+        BS->WaitForEvent(1, &ST->ConIn->WaitForKey, &idx);
+        status = ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
+        if(EFI_ERROR(status))
+            continue;
+
+        switch(key.ScanCode|key.UnicodeChar) {
+        case 'k': case 1: /* UP */ menuselect = max(menuselect-1, 0); break;
+        case 'j': case 2: /* DOWN */ menuselect = min(menuselect+1, boot_entries.size-1); break;
+        case '\r': case '\n': // TODO: Load selected entry.
+        case 'q': return;
+        }
     }
 }
 
@@ -124,7 +151,7 @@ int main(int argc, char *argv[]) {
 
     menu();
 
-    for(size_t i = 0; i<boot_entries.size; ++i)
+    for(int i = 0; i<boot_entries.size; ++i)
         free(GET_BOOT_ENTRY(i));
     free(boot_order);
     RT->ResetSystem(EfiResetShutdown, 0, 0, NULL);

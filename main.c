@@ -1,27 +1,31 @@
 #include <uefi.h>
 
-#define LINE_MAX 256
-
-#define assert(x) (!(x) \
-        ?  printf("\n%s:%d: Assertion! %s\n", __FILE__, __LINE__, #x), \
-           printf("Press any key to continue ...\n"), \
-           getchar(), exit(1) \
+#define assert(X) (!(X)                                                         \
+        ? printf("\n%s:%d: Assertion! %s\n", __FILE__, __LINE__, #X),           \
+          printf("Press any key to continue ...\n"),                            \
+          getchar(), exit(1)                                                    \
         : (void)0)
 
-// https://uefi.org/specs/UEFI/2.10/10_Protocols_Device_Path_Protocol.html?highlight=efi_device_path_protocol
-typedef struct {
-    uint8_t type;
-    uint8_t sub_type;
-    uint8_t length[2];
-    uint8_t data[];
-} efi_device_path_protocol_t;
+// EFI function call error/warning status handling.
+efi_status_t ECS;
+static inline efi_status_t efi_call_log(const char *file, int line) {
+    if(EFI_ERROR(ECS))
+        printf("\n%s:%d: EFI error: %d\n", file, line, ~EFI_ERROR_MASK&ECS);
+    else // EFI oem_error or warning.
+        printf("\n%s:%d: EFI warning: %d\n", file, line, ECS);
+    printf("Press any key to continue ...\n");
+    getchar();
+    // Discard warnings.
+    return EFI_ERROR(ECS);
+}
+#define EE(F) if((ECS = F) && efi_call_log(__FILE__, __LINE__))
 
 // https://uefi.org/specs/UEFI/2.10/03_Boot_Manager.html#load-options
 typedef struct {
     uint32_t attributes;
     uint16_t file_path_list_length;
     wchar_t description[];
-    //efi_device_path_protocol_t file_path_list[];
+    //efi_device_path_t file_path_list[];
     //uint8_t optional_data[];
 } efi_load_option_header_t;
 
@@ -31,34 +35,13 @@ size_t wstrlen(wchar_t *str) {
     return size;
 }
 
-void hexdump(const void *buf, uintn_t size) {
-    assert(buf); // Data to hexdump.
+void hexdump(const void *data, uintn_t size) {
+    assert(data);
 
-    const uint8_t *p = buf;
-    for(uintn_t i = 0; i<size; ++i)
-        printf("%02X ", p[i]);
-    putchar('\n');
-}
-
-void * efi_get_variable(char *name, efi_guid_t guid, uintn_t *size) {
-    assert(name); // Variable name.
-    assert(size); // Output size.
-
-    wchar_t u8strbuf[LINE_MAX];
-    mbstowcs(u8strbuf, name, LINE_MAX);
-
-    char buf[BUFSIZ];
-    *size = sizeof(buf);
-    efi_status_t status = RT->GetVariable(u8strbuf, &guid, NULL, size, buf);
-    if(EFI_ERROR(status)) {
-        printf("Error getting variable %s: %d\n", name, ~EFI_ERROR_MASK&status);
-        getchar();
-        exit(1);
-    }
-
-    char *copy = malloc(*size);
-    memcpy(copy, buf, *size);
-    return copy;
+    char fmt[] = "%00D"; // 16-byte xxd line.
+    sprintf(fmt+1, "%02d", min(size/16, 16));
+    fmt[3] = 'D';
+    printf(fmt, data);
 }
 
 enum { BOOT_ENTRY_MAX = 15 };
@@ -73,59 +56,77 @@ struct {
      boot_entries.option_size[boot_entries.size] = SIZE,                        \
      boot_entries.option[boot_entries.size++] = OPT)
 
-#define GET_BOOT_ENTRY(index)                                                   \
+#define GET_BOOT_ENTRY(I)                                                       \
     ((struct {                                                                  \
         uint32_t attributes;                                                    \
         uint16_t file_path_list_length;                                         \
-        wchar_t description[wstrlen(boot_entries.option[index]->description)];  \
-        char file_path_list[boot_entries.option[index]->file_path_list_length]; \
-        uint8_t optional_data[boot_entries.option_size[index]-4-2               \
-                              -wstrlen(boot_entries.option[index]->description) \
-                              -boot_entries.option[index]->file_path_list_length\
+        wchar_t description[wstrlen(boot_entries.option[I]->description)];      \
+        char file_path_list[boot_entries.option[I]->file_path_list_length];     \
+        uint8_t optional_data[boot_entries.option_size[I]-4-2                   \
+                              -wstrlen(boot_entries.option[I]->description)     \
+                              -boot_entries.option[I]->file_path_list_length    \
                              ];                                                 \
-    } *)boot_entries.option[index])
+    } *)boot_entries.option[I])
+
+enum {
+    TEXT_DFLT = EFI_TEXT_ATTR(EFI_WHITE, EFI_BLACK),
+    TEXT_HIGH = EFI_TEXT_ATTR(EFI_BLACK, EFI_LIGHTGRAY)
+};
 
 int menuselect = 0;
 void menu() {
-    efi_status_t status;
     uintn_t idx;
-    efi_input_key_t key = {0};
+    efi_input_key_t key;
 
     for(;;) {
-        ST->ConOut->SetAttribute(ST->ConOut, 0x0F);
+        ST->ConOut->SetAttribute(ST->ConOut, TEXT_DFLT);
         ST->ConOut->ClearScreen(ST->ConOut);
 
         printf("                                    BootMenu                                    \n");
-        printf("+------------------------------------------------------------------------------+\n");
+        putchar(BOXDRAW_DOWN_RIGHT);
+        for(int i = 0; i<78; ++i) putchar(BOXDRAW_HORIZONTAL);
+        printf("%c\n", BOXDRAW_DOWN_LEFT);
+
         for(int i = 0; i<BOOT_ENTRY_MAX; ++i) {
             if(i<boot_entries.size) {
-                putchar('+');
+                putchar(BOXDRAW_VERTICAL);
                 if(i==menuselect)
-                    ST->ConOut->SetAttribute(ST->ConOut, 0x70);
+                    ST->ConOut->SetAttribute(ST->ConOut, TEXT_HIGH);
                 int num = printf(" %d. ", i);
                 ST->ConOut->OutputString(ST->ConOut, GET_BOOT_ENTRY(i)->description);
                 int wb = 78-num-wstrlen(GET_BOOT_ENTRY(i)->description);
                 while(wb--) putchar(' ');
                 if(i==menuselect)
-                    ST->ConOut->SetAttribute(ST->ConOut, 0x0F);
-                printf("+\n");
+                    ST->ConOut->SetAttribute(ST->ConOut, TEXT_DFLT);
+                printf("%c\n", BOXDRAW_VERTICAL);
             }
             else {
-                printf("+                                                                              +\n");
+                putchar(BOXDRAW_VERTICAL);
+                for(int i = 0; i<78; ++i) putchar(' ');
+                printf("%c\n", BOXDRAW_VERTICAL);
             }
         }
-        printf("+------------------------------------------------------------------------------+\n");
+        putchar(BOXDRAW_UP_RIGHT);
+        for(int i = 0; i<78; ++i) putchar(BOXDRAW_HORIZONTAL);
+        printf("%c\n", BOXDRAW_UP_LEFT);
 
         BS->WaitForEvent(1, &ST->ConIn->WaitForKey, &idx);
-        status = ST->ConIn->ReadKeyStroke(ST->ConIn, &key);
-        if(EFI_ERROR(status))
+        EE(ST->ConIn->ReadKeyStroke(ST->ConIn, &key))
             continue;
 
         switch(key.ScanCode|key.UnicodeChar) {
-        case 'k': case 1: /* UP */ menuselect = max(menuselect-1, 0); break;
-        case 'j': case 2: /* DOWN */ menuselect = min(menuselect+1, boot_entries.size-1); break;
-        case '\r': case '\n': // TODO: Load selected entry.
-        case 'q': return;
+        case 'K': case 'k': case SCAN_UP:
+            menuselect = max(menuselect-1, 0);
+            break;
+        case 'J': case 'j': case SCAN_DOWN:
+            menuselect = min(menuselect+1, boot_entries.size-1);
+            break;
+        case CHAR_CARRIAGE_RETURN: case CHAR_LINEFEED:
+            // TODO: Load selected entry.
+            exit_bs();
+            break;
+        case 'Q': case 'q':
+            return;
         }
     }
 }
@@ -134,9 +135,9 @@ int main(int argc, char *argv[]) {
     (void)argc, (void)argv;
 
     /* Get BootOrder list. */
-    uintn_t size;
-    uint16_t *boot_order =
-        efi_get_variable("BootOrder", (efi_guid_t)EFI_GLOBAL_VARIABLE, &size);
+    /* NOTE: getenv has a bug, we have to explicitly set size before call. */
+    uintn_t size = EFI_MAXIMUM_VARIABLE_SIZE;
+    uint16_t *boot_order = (uint16_t *)getenv("BootOrder", &size);
     int boot_entries_size = size/sizeof(*boot_order);
 
     /* Iterate all Boot#### entries get from BootOrder. */
@@ -144,9 +145,10 @@ int main(int argc, char *argv[]) {
         char_t option_name[9];
         sprintf(option_name, "Boot%04d", boot_order[i]);
 
-        efi_load_option_header_t *option =
-            efi_get_variable(option_name, (efi_guid_t)EFI_GLOBAL_VARIABLE, &size);
-        ADD_BOOT_ENTRY(option, size);
+        size = EFI_MAXIMUM_VARIABLE_SIZE;
+        efi_load_option_header_t *option = (void *)getenv(option_name, &size);
+        if(option)
+            ADD_BOOT_ENTRY(option, size);
     }
 
     menu();

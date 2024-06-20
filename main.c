@@ -3,22 +3,27 @@
 #define assert(X) (!(X)                                                         \
         ? printf("\n%s:%d: Assertion! %s\n", __FILE__, __LINE__, #X),           \
           printf("Press any key to continue ...\n"),                            \
-          getchar(), exit(1)                                                    \
+          getchar_timeout(), abort()                                            \
         : (void)0)
 
+static inline uint16_t getchar_timeout() {
+    // TODO: Implement timeout.
+    return getchar();
+}
+
 // EFI function call error/warning status handling.
+#define EE(F) if((ECS = F) && efi_call_log(__FILE__, __LINE__, #F))
 efi_status_t ECS;
-static inline efi_status_t efi_call_log(const char *file, int line) {
+static inline efi_status_t efi_call_log(const char *file, int line, const char *func) {
     if(EFI_ERROR(ECS))
-        printf("\n%s:%d: EFI error: %d\n", file, line, ~EFI_ERROR_MASK&ECS);
+        printf("\n%s:%d: EFI error: %s: %d\n", file, line, func, ~EFI_ERROR_MASK&ECS);
     else // EFI oem_error or warning.
-        printf("\n%s:%d: EFI warning: %d\n", file, line, ECS);
+        printf("\n%s:%d: EFI warning: %s: %d\n", file, line, func, ECS);
     printf("Press any key to continue ...\n");
-    getchar();
+    getchar_timeout();
     // Discard warnings.
     return EFI_ERROR(ECS);
 }
-#define EE(F) if((ECS = F) && efi_call_log(__FILE__, __LINE__))
 
 // https://uefi.org/specs/UEFI/2.10/03_Boot_Manager.html#load-options
 typedef struct {
@@ -50,6 +55,7 @@ struct {
     uint32_t option_size[BOOT_ENTRY_MAX];
     efi_load_option_header_t *option[BOOT_ENTRY_MAX];
 } boot_entries;
+uint16_t menuselect;
 
 #define ADD_BOOT_ENTRY(OPT, SIZE)                                               \
     (assert(boot_entries.size<BOOT_ENTRY_MAX),                                  \
@@ -60,10 +66,10 @@ struct {
     ((struct {                                                                  \
         uint32_t attributes;                                                    \
         uint16_t file_path_list_length;                                         \
-        wchar_t description[wstrlen(boot_entries.option[I]->description)];      \
+        wchar_t description[wstrlen(boot_entries.option[I]->description)+1];    \
         char file_path_list[boot_entries.option[I]->file_path_list_length];     \
         uint8_t optional_data[boot_entries.option_size[I]-4-2                   \
-                              -wstrlen(boot_entries.option[I]->description)     \
+                              -wstrlen(boot_entries.option[I]->description)-2   \
                               -boot_entries.option[I]->file_path_list_length    \
                              ];                                                 \
     } *)boot_entries.option[I])
@@ -73,7 +79,25 @@ enum {
     TEXT_HIGH = EFI_TEXT_ATTR(EFI_BLACK, EFI_LIGHTGRAY)
 };
 
-int menuselect = 0;
+void boot_menuselect() {
+    // Setup watchdog timer before loading and starting image.
+    wchar_t watchdog_str[] = L"BootMenu StartImage timer.";
+    EE(BS->SetWatchdogTimer(300, 0xB00B5, sizeof(watchdog_str), watchdog_str)) {}
+
+    efi_handle_t image;
+    EE(BS->LoadImage(1, IM, (efi_device_path_t *)GET_BOOT_ENTRY(
+                    menuselect)->file_path_list, NULL, 0, &image))
+        goto exit;
+
+    typedef efi_status_t (EFIAPI *efi_image_unload_t)(efi_handle_t ImageHandle);
+    EE(BS->StartImage(image, NULL, NULL))
+        EE(((efi_image_unload_t)BS->UnloadImage)(image)) {}
+
+exit:
+    // Disable BootMenu watchdog timer.
+    EE(BS->SetWatchdogTimer(0, 0xB00B5, 0, NULL)) {}
+}
+
 void menu() {
     uintn_t idx;
     efi_input_key_t key;
@@ -122,8 +146,13 @@ void menu() {
             menuselect = min(menuselect+1, boot_entries.size-1);
             break;
         case CHAR_CARRIAGE_RETURN: case CHAR_LINEFEED:
-            // TODO: Load selected entry.
-            exit_bs();
+            //exit_bs();
+            boot_menuselect();
+            break;
+        case 'E': case 'e':
+            hexdump(GET_BOOT_ENTRY(menuselect)->file_path_list, sizeof(efi_device_path_t));
+            hexdump(LIP->FilePath, sizeof(efi_device_path_t));
+            getchar_timeout();
             break;
         case 'Q': case 'q':
             return;
@@ -151,6 +180,8 @@ int main(int argc, char *argv[]) {
             ADD_BOOT_ENTRY(option, size);
     }
 
+    // Disable Firmware BootManager watchdog timer.
+    EE(BS->SetWatchdogTimer(0, 0xB00B5, 0, NULL)) {}
     menu();
 
     for(int i = 0; i<boot_entries.size; ++i)
